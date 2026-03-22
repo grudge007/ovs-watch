@@ -12,6 +12,8 @@ import (
 )
 
 var interval int
+var loadedBridges map[string]bool
+var loadedPorts map[string]string
 
 var rootCmd = &cobra.Command{
 	Use:   "ovs-watch",
@@ -22,23 +24,36 @@ var bridgeCmd = &cobra.Command{
 	Use:   "bridge",
 	Short: "watch bridge",
 	Run: func(cmd *cobra.Command, args []string) {
-		out, err := loadExistingBridges(Scanner)
-		if err != nil {
-			fmt.Printf("Error: %v\n", err)
-			return
-		}
-		watchBridge(out, Scanner, time.Duration(interval)*time.Second)
+		watchBridge(loadedBridges, time.Duration(interval)*time.Second)
+	},
+}
+
+var portCmd = &cobra.Command{
+	Use:   "port",
+	Short: "watch ports",
+	Run: func(cmd *cobra.Command, args []string) {
+		watchPort(loadedPorts, time.Duration(interval)*time.Second)
 	},
 }
 
 func init() {
 	rootCmd.AddCommand(bridgeCmd)
+	rootCmd.AddCommand(portCmd)
 }
+
 func main() {
+	var err error
 	fmt.Println("ovs-watch initilized....")
 
+	loadedBridges, err = LoadExistingBridges()
+	loadedPorts = LoadExistingPorts(loadedBridges)
+	if err != nil {
+		fmt.Printf("Error: %v\n", err)
+		return
+	}
 	bridgeCmd.Flags().IntVarP(&interval, "interval", "i", 5, "interval value")
-	err := rootCmd.Execute()
+	portCmd.Flags().IntVarP(&interval, "interval", "i", 5, "interval value")
+	err = rootCmd.Execute()
 	if err != nil {
 		fmt.Println(err)
 		os.Exit(1)
@@ -46,23 +61,16 @@ func main() {
 
 }
 
-func loadExistingBridges(Scanner func([]byte) map[string]bool) (map[string]bool, error) {
-	cmd := exec.Command("ovs-vsctl", "list-br")
-	output, err := cmd.Output()
-
-	if err != nil {
-		return nil, err
-	}
-	existingBridges := Scanner(output)
-
-	return existingBridges, err
-}
-
-func watchBridge(loadedBridges map[string]bool, Scanner func([]byte) map[string]bool, interval time.Duration) {
+// bridge watch
+func watchBridge(loadedBridges map[string]bool, interval time.Duration) {
 	for {
 		cmd := exec.Command("ovs-vsctl", "list-br")
-		out, _ := cmd.Output()
-		CurrentBridges := Scanner(out)
+		out, err := cmd.Output()
+		if err != nil {
+			fmt.Printf("Error: %v\n", err)
+			return
+		}
+		CurrentBridges, _ := SliceScanner(out)
 		var keysToDel []string
 		var keysToAdd []string
 
@@ -96,12 +104,87 @@ func watchBridge(loadedBridges map[string]bool, Scanner func([]byte) map[string]
 
 }
 
-func Scanner(input []byte) map[string]bool {
-	outPut := make(map[string]bool)
+// port watch
+func watchPort(loadedPorts map[string]string, interval time.Duration) {
+
+	for {
+		portUpdates := make(map[string]string)
+		var portDegrades []string
+		loadedBridges, _ := LoadExistingBridges()
+		currentPorts := LoadExistingPorts(loadedBridges)
+		for ports, bridge := range currentPorts {
+			oldBridge, exists := loadedPorts[ports]
+			if exists && oldBridge == bridge {
+				continue
+			}
+			if !exists {
+				fmt.Printf("New Port Detected: %v  ->  %v \n", ports, bridge)
+				portUpdates[ports] = bridge
+			} else {
+				fmt.Printf("Updated Detected: %v from %v to %v\n", ports, oldBridge, bridge)
+				portUpdates[ports] = bridge
+			}
+		}
+		for key, value := range portUpdates {
+			loadedPorts[key] = value
+		}
+
+		for port := range loadedPorts {
+			_, isExist := currentPorts[port]
+			if !isExist {
+				portDegrades = append(portDegrades, port)
+				fmt.Printf("Port Deletion Detected: %v\n", port)
+			}
+		}
+		for _, bridge := range portDegrades {
+			delete(loadedPorts, bridge)
+		}
+		time.Sleep(interval)
+
+	}
+
+}
+
+// utils
+func LoadExistingBridges() (map[string]bool, error) {
+	cmd := exec.Command("ovs-vsctl", "list-br")
+	output, err := cmd.Output()
+
+	if err != nil {
+		return nil, err
+	}
+	existingBridges, _ := SliceScanner(output)
+
+	return existingBridges, err
+}
+
+func LoadExistingPorts(loadedBridges map[string]bool) map[string]string {
+	loadedPorts := make(map[string]string)
+	var loadedPortsSlice []string
+	for bridge := range loadedBridges {
+		cmd := exec.Command("ovs-vsctl", "list-ports", bridge)
+		output, err := cmd.Output()
+		if err != nil {
+			continue
+		}
+		_, loadedPortsSlice = SliceScanner(output)
+		for _, port := range loadedPortsSlice {
+			loadedPorts[port] = bridge
+		}
+
+	}
+	return loadedPorts
+
+}
+
+func SliceScanner(input []byte) (map[string]bool, []string) {
+	outPutMap := make(map[string]bool)
+	var outPutSlice []string
 	scanner := bufio.NewScanner(strings.NewReader(string(input)))
 	for scanner.Scan() {
 		line := scanner.Text()
-		outPut[line] = true
+		outPutMap[line] = true
+		outPutSlice = append(outPutSlice, line)
 	}
-	return outPut
+	return outPutMap, outPutSlice
 }

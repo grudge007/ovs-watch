@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"fmt"
+	"maps"
 	"os"
 	"os/exec"
 	"strings"
@@ -13,8 +14,7 @@ import (
 
 var interval int
 var bridgeName string
-var loadedBridges map[string]bool
-var loadedPorts map[string]string
+var watchIfaceState bool
 
 var rootCmd = &cobra.Command{
 	Use:   "ovs-watch",
@@ -57,18 +57,31 @@ var portCmd = &cobra.Command{
 	},
 }
 
+var ifaceCmd = &cobra.Command{
+	Use:   "iface",
+	Short: "watch interface state",
+	Run: func(cmd *cobra.Command, args []string) {
+		watchInterfaceState(time.Duration(interval) * time.Second)
+	},
+}
+
 func init() {
 	rootCmd.AddCommand(bridgeCmd)
 	rootCmd.AddCommand(portCmd)
+	rootCmd.AddCommand(ifaceCmd)
 }
 
 func main() {
 	fmt.Println("ovs-watch initialized....")
 
 	bridgeCmd.Flags().IntVarP(&interval, "interval", "i", 5, "interval value")
+	bridgeCmd.Flags().BoolVarP(&watchIfaceState, "watch-iface", "w", false, "Enable interface state watch")
 
 	portCmd.Flags().IntVarP(&interval, "interval", "i", 5, "interval value")
-	portCmd.Flags().StringVarP(&bridgeName, "bridge", "b", "None", "bridge name")
+	portCmd.Flags().StringVarP(&bridgeName, "bridge", "b", "", "bridge name")
+	portCmd.Flags().BoolVarP(&watchIfaceState, "watch-iface", "w", false, "Enable interface state watch")
+
+	ifaceCmd.Flags().IntVarP(&interval, "interval", "i", 5, "interval value")
 
 	if err := rootCmd.Execute(); err != nil {
 		fmt.Println(err)
@@ -80,23 +93,19 @@ func main() {
 func watchBridge(loadedBridges map[string]bool, interval time.Duration) {
 
 	for {
-		cmd := exec.Command("ovs-vsctl", "list-br")
-		out, err := cmd.Output()
+		CurrentBridges, err := LoadExistingBridges()
 		if err != nil {
 			fmt.Printf("Error: %v\n", err)
 			return
 		}
-		CurrentBridges, _ := SliceScanner(out)
 		var keysToDel []string
-		var keysToAdd []string
-
 		// check for newly added bridges
 		for bridge := range CurrentBridges {
 			if loadedBridges[bridge] {
 				continue
 			} else {
-				keysToAdd = append(keysToAdd, bridge)
 				fmt.Printf("Created: %v\n", bridge)
+				loadedBridges[bridge] = true
 			}
 
 		}
@@ -109,9 +118,6 @@ func watchBridge(loadedBridges map[string]bool, interval time.Duration) {
 				fmt.Printf("Deleted: %v\n", bridge)
 			}
 		}
-		for _, bridge := range keysToAdd {
-			loadedBridges[bridge] = true
-		}
 		for _, bridge := range keysToDel {
 			delete(loadedBridges, bridge)
 		}
@@ -122,8 +128,42 @@ func watchBridge(loadedBridges map[string]bool, interval time.Duration) {
 
 // port watch
 func watchPort(loadedPorts map[string]string, interval time.Duration, bridgeName string) {
+	var loadedBridges map[string]bool
 	switch bridgeName {
-	case "None":
+	default:
+		loadedPorts := LoadExistingPorts(loadedBridges, bridgeName)
+		for {
+			var portUpdates []string
+			var portDegrades []string
+			currentPorts := LoadExistingPorts(loadedBridges, bridgeName)
+			for ports := range currentPorts {
+				_, isExist := loadedPorts[ports]
+				if !isExist {
+					fmt.Printf("New Port Detected: %v  ->  %v \n", ports, bridgeName)
+					portUpdates = append(portUpdates, ports)
+					loadedPorts[ports] = bridgeName
+				}
+			}
+
+			for _, key := range portUpdates {
+				loadedPorts[key] = bridgeName
+			}
+
+			for ports := range loadedPorts {
+				_, isExist := currentPorts[ports]
+				if !isExist {
+					fmt.Printf("Port Deletion Detected: %v\n", ports)
+					portDegrades = append(portDegrades, ports)
+				}
+			}
+
+			for _, key := range portDegrades {
+				delete(loadedPorts, key)
+			}
+			time.Sleep(interval)
+		}
+
+	case "":
 		for {
 			portUpdates := make(map[string]string)
 			var portDegrades []string
@@ -159,42 +199,50 @@ func watchPort(loadedPorts map[string]string, interval time.Duration, bridgeName
 			time.Sleep(interval)
 
 		}
-	default:
-		var portUpdates []string
+	}
+
+}
+
+// watch port state
+func watchInterfaceState(interval time.Duration) {
+	loadedIfaceState := LoadInterfaceStatus()
+	for {
+		portUpdates := make(map[string]string)
 		var portDegrades []string
-		loadedPorts := LoadExistingPorts(loadedBridges, bridgeName)
-		for {
-			currentPorts := LoadExistingPorts(loadedBridges, bridgeName)
-			for ports := range currentPorts {
-				_, isExist := loadedPorts[ports]
-				if !isExist {
-					fmt.Printf("New Port Detected: %v  ->  %v \n", ports)
-					portUpdates = append(portUpdates, ports)
-				}
+		currentIfaceState := LoadInterfaceStatus()
+		for iface, state := range currentIfaceState {
+			oldState, isExist := loadedIfaceState[iface]
+			if !isExist {
+				fmt.Printf("New Port Detected: %v\n", iface)
+				portUpdates[iface] = state
+				continue
 			}
 
-			for _, key := range portUpdates {
-				loadedPorts[key] = bridgeName
+			if oldState != state {
+				fmt.Printf("State of %v Changed To %v\n", iface, state)
+				portUpdates[iface] = state
+				continue
 			}
-
-			for ports := range loadedPorts {
-				_, isExist := currentPorts[ports]
-				if !isExist {
-					fmt.Printf("Port Deletion Detected: %v\n", ports)
-					portDegrades = append(portDegrades, ports)
-				}
-			}
-
-			for _, key := range portDegrades {
-				delete(loadedPorts, key)
-			}
-			time.Sleep(interval)
 		}
+		for iface := range loadedIfaceState {
+			_, isExist := currentIfaceState[iface]
+			if !isExist {
+				fmt.Printf("Port Deletion Detected: %v\n", iface)
+				portDegrades = append(portDegrades, iface)
+			}
+		}
+
+		for _, iface := range portDegrades {
+			delete(loadedIfaceState, iface)
+		}
+		maps.Copy(loadedIfaceState, portUpdates)
+		time.Sleep(interval)
 	}
 
 }
 
 // utils
+// load bridges
 func LoadExistingBridges() (map[string]bool, error) {
 	cmd := exec.Command("ovs-vsctl", "list-br")
 	output, err := cmd.Output()
@@ -202,30 +250,16 @@ func LoadExistingBridges() (map[string]bool, error) {
 	if err != nil {
 		return nil, err
 	}
-	existingBridges, _ := SliceScanner(output)
+	existingBridges := SliceScannerSet(output)
 
 	return existingBridges, err
 }
 
+// load ports
 func LoadExistingPorts(loadedBridges map[string]bool, bridgeName string) map[string]string {
 	loadedPorts := make(map[string]string)
 	var loadedPortsSlice []string
 	switch bridgeName {
-	case "None":
-		for bridge := range loadedBridges {
-			cmd := exec.Command("ovs-vsctl", "list-ports", bridge)
-			output, err := cmd.Output()
-			if err != nil {
-				continue
-			}
-			_, loadedPortsSlice = SliceScanner(output)
-			for _, port := range loadedPortsSlice {
-				loadedPorts[port] = bridge
-			}
-
-		}
-		return loadedPorts
-
 	default:
 		cmd := exec.Command("ovs-vsctl", "list-ports", bridgeName)
 		output, err := cmd.Output()
@@ -233,24 +267,69 @@ func LoadExistingPorts(loadedBridges map[string]bool, bridgeName string) map[str
 			fmt.Printf("Err: %v\n", err)
 			os.Exit(1)
 		}
-		_, loadedPortsSlice = SliceScanner(output)
+		loadedPortsSlice = SliceScanner(output)
 		for _, port := range loadedPortsSlice {
 			loadedPorts[port] = bridgeName
 		}
 		return loadedPorts
 
+	case "":
+		for bridge := range loadedBridges {
+			cmd := exec.Command("ovs-vsctl", "list-ports", bridge)
+			output, err := cmd.Output()
+			if err != nil {
+				continue
+			}
+			loadedPortsSlice = SliceScanner(output)
+			for _, port := range loadedPortsSlice {
+				loadedPorts[port] = bridge
+			}
+
+		}
+		return loadedPorts
 	}
 
 }
 
-func SliceScanner(input []byte) (map[string]bool, []string) {
-	outPutMap := make(map[string]bool)
+// load interface status
+func LoadInterfaceStatus() map[string]string {
+	loadedIfaceState := make(map[string]string)
+	cmd := exec.Command("ovs-vsctl", "--format=csv", "--columns=name,link_state", "list", "Interface")
+	out, err := cmd.Output()
+	if err != nil {
+		fmt.Printf("Err: %v", err)
+		os.Exit(1)
+	}
+	outPut := SliceScanner(out)
+
+	for i, rawLine := range outPut {
+		if i == 0 {
+			continue
+		}
+		ifaceRaw := strings.Split(rawLine, ",")
+		loadedIfaceState[ifaceRaw[0]] = ifaceRaw[1]
+
+	}
+	return loadedIfaceState
+
+}
+
+func SliceScanner(input []byte) []string {
 	var outPutSlice []string
 	scanner := bufio.NewScanner(strings.NewReader(string(input)))
 	for scanner.Scan() {
 		line := scanner.Text()
-		outPutMap[line] = true
 		outPutSlice = append(outPutSlice, line)
 	}
-	return outPutMap, outPutSlice
+	return outPutSlice
+}
+
+func SliceScannerSet(input []byte) map[string]bool {
+	outPutMap := make(map[string]bool)
+	scanner := bufio.NewScanner(strings.NewReader(string(input)))
+	for scanner.Scan() {
+		line := scanner.Text()
+		outPutMap[line] = true
+	}
+	return outPutMap
 }
